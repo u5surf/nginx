@@ -22,6 +22,11 @@ typedef struct {
     ngx_str_t            etag;
     unsigned             last:1;
     unsigned             active:1;
+    unsigned             done:1;
+    unsigned             background:1;
+    unsigned             retry:1;
+    unsigned             retried:1;
+    unsigned             refetch:1;
     ngx_http_request_t  *sr;
 } ngx_http_slice_ctx_t;
 
@@ -40,7 +45,13 @@ static ngx_int_t ngx_http_slice_parse_content_range(ngx_http_request_t *r,
     ngx_http_slice_content_range_t *cr);
 static ngx_int_t ngx_http_slice_range_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
+static ngx_int_t ngx_http_slice_refetch_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data);
 static off_t ngx_http_slice_get_start(ngx_http_request_t *r);
+#if (NGX_HTTP_CACHE)
+static void ngx_http_slice_cancel_background_update(ngx_http_request_t *r);
+static void ngx_http_slice_cancelled_handler(ngx_http_request_t *r);
+#endif
 static void *ngx_http_slice_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_slice_merge_loc_conf(ngx_conf_t *cf, void *parent,
     void *child);
@@ -93,6 +104,7 @@ ngx_module_t  ngx_http_slice_filter_module = {
 
 
 static ngx_str_t  ngx_http_slice_range_name = ngx_string("slice_range");
+static ngx_str_t  ngx_http_slice_refetch_name = ngx_string("slice_refetch");
 
 static ngx_http_output_header_filter_pt  ngx_http_next_header_filter;
 static ngx_http_output_body_filter_pt    ngx_http_next_body_filter;
@@ -109,13 +121,20 @@ ngx_http_slice_header_filter(ngx_http_request_t *r)
     ngx_http_slice_content_range_t   cr;
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_slice_filter_module);
-    if (ctx == NULL) {
+    if (ctx == NULL || ctx->done || ctx->background) {
         return ngx_http_next_header_filter(r);
+    }
+
+    if (r != r->main) {
+        ctx = ngx_http_get_module_ctx(r->main, ngx_http_slice_filter_module);
+        if (ctx == NULL) {
+            return NGX_ERROR;
+        }
     }
 
     if (r->headers_out.status != NGX_HTTP_PARTIAL_CONTENT) {
         if (r == r->main) {
-            ngx_http_set_ctx(r, NULL, ngx_http_slice_filter_module);
+            ctx->done = 1;
             return ngx_http_next_header_filter(r);
         }
 
@@ -133,6 +152,30 @@ ngx_http_slice_header_filter(ngx_http_request_t *r)
             || ngx_strncmp(h->value.data, ctx->etag.data, ctx->etag.len)
                != 0)
         {
+#if (NGX_HTTP_CACHE)
+            if (r != r->main && r->cached && !ctx->retried) {
+
+                /*
+                 * an outdated slice from cache: discard the response
+                 * and fetch the slice again, bypassing cache with
+                 * the $slice_refetch variable
+                 */
+
+                ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                              "etag mismatch in cached slice response, "
+                              "fetching it again");
+
+                ngx_http_slice_cancel_background_update(r);
+
+                ctx->retry = 1;
+                ctx->retried = 1;
+
+                r->header_only = 1;
+
+                return NGX_OK;
+            }
+#endif
+
             ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                           "etag mismatch in slice response");
             return NGX_ERROR;
@@ -172,6 +215,7 @@ ngx_http_slice_header_filter(ngx_http_request_t *r)
 
     ctx->start = end;
     ctx->active = 1;
+    ctx->retried = 0;
 
     r->headers_out.status = NGX_HTTP_OK;
     r->headers_out.status_line.len = 0;
@@ -218,13 +262,15 @@ static ngx_int_t
 ngx_http_slice_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 {
     ngx_int_t                   rc;
+    u_char                     *p;
+    ngx_uint_t                  refetch;
     ngx_chain_t                *cl;
-    ngx_http_slice_ctx_t       *ctx;
+    ngx_http_slice_ctx_t       *ctx, *sctx;
     ngx_http_slice_loc_conf_t  *slcf;
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_slice_filter_module);
 
-    if (ctx == NULL || r != r->main) {
+    if (ctx == NULL || ctx->done || r != r->main) {
         return ngx_http_next_body_filter(r, in);
     }
 
@@ -247,20 +293,42 @@ ngx_http_slice_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         return rc;
     }
 
-    if (!ctx->active) {
+    refetch = 0;
+
+    if (ctx->retry) {
+        ctx->retry = 0;
+        refetch = 1;
+
+    } else if (!ctx->active) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                       "missing slice response");
         return NGX_ERROR;
     }
 
     if (ctx->start >= ctx->end) {
-        ngx_http_set_ctx(r, NULL, ngx_http_slice_filter_module);
+        ctx->done = 1;
         ngx_http_send_special(r, NGX_HTTP_LAST);
         return rc;
     }
 
     if (r->buffered) {
         return rc;
+    }
+
+    /*
+     * each slice subrequest has its own context with its own range,
+     * so that a background cache update started from it could still
+     * see the range after the main request has moved on
+     */
+
+    sctx = ngx_pcalloc(r->pool, sizeof(ngx_http_slice_ctx_t));
+    if (sctx == NULL) {
+        return NGX_ERROR;
+    }
+
+    p = ngx_pnalloc(r->pool, sizeof("bytes=-") - 1 + 2 * NGX_OFF_T_LEN);
+    if (p == NULL) {
+        return NGX_ERROR;
     }
 
     if (ngx_http_subrequest(r, &r->uri, &r->args, &ctx->sr, NULL,
@@ -270,18 +338,20 @@ ngx_http_slice_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         return NGX_ERROR;
     }
 
-    ngx_http_set_ctx(ctx->sr, ctx, ngx_http_slice_filter_module);
+    ngx_http_set_ctx(ctx->sr, sctx, ngx_http_slice_filter_module);
 
     slcf = ngx_http_get_module_loc_conf(r, ngx_http_slice_filter_module);
 
-    ctx->range.len = ngx_sprintf(ctx->range.data, "bytes=%O-%O", ctx->start,
-                                 ctx->start + (off_t) slcf->size - 1)
-                     - ctx->range.data;
+    sctx->refetch = refetch;
+    sctx->range.data = p;
+    sctx->range.len = ngx_sprintf(p, "bytes=%O-%O", ctx->start,
+                                  ctx->start + (off_t) slcf->size - 1)
+                      - p;
 
     ctx->active = 0;
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "http slice subrequest: \"%V\"", &ctx->range);
+                   "http slice subrequest: \"%V\"", &sctx->range);
 
     return rc;
 }
@@ -396,10 +466,40 @@ ngx_http_slice_range_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data)
 {
     u_char                     *p;
-    ngx_http_slice_ctx_t       *ctx;
+    ngx_http_slice_ctx_t       *ctx, *pctx;
     ngx_http_slice_loc_conf_t  *slcf;
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_slice_filter_module);
+
+    if (ctx == NULL
+        && r->background
+        && r->loc_conf == r->parent->loc_conf)
+    {
+        /* background cache update, inherit range of the parent request */
+
+        pctx = ngx_http_get_module_ctx(r->parent,
+                                       ngx_http_slice_filter_module);
+
+        if (pctx == NULL || pctx->range.len == 0) {
+            v->not_found = 1;
+            return NGX_OK;
+        }
+
+        ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_slice_ctx_t));
+        if (ctx == NULL) {
+            return NGX_ERROR;
+        }
+
+        ctx->range = pctx->range;
+        ctx->background = 1;
+
+        ngx_http_set_ctx(r, ctx, ngx_http_slice_filter_module);
+    }
+
+    if (ctx && ctx->done) {
+        v->not_found = 1;
+        return NGX_OK;
+    }
 
     if (ctx == NULL) {
         if (r != r->main || r->headers_out.status) {
@@ -443,6 +543,29 @@ ngx_http_slice_range_variable(ngx_http_request_t *r,
     v->not_found = 0;
     v->no_cacheable = 1;
     v->len = ctx->range.len;
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_slice_refetch_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data)
+{
+    ngx_http_slice_ctx_t  *ctx;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_slice_filter_module);
+
+    if (ctx == NULL || !ctx->refetch) {
+        v->not_found = 1;
+        return NGX_OK;
+    }
+
+    v->len = 1;
+    v->valid = 1;
+    v->no_cacheable = 1;
+    v->not_found = 0;
+    v->data = (u_char *) "1";
 
     return NGX_OK;
 }
@@ -497,6 +620,47 @@ ngx_http_slice_get_start(ngx_http_request_t *r)
 }
 
 
+#if (NGX_HTTP_CACHE)
+
+static void
+ngx_http_slice_cancel_background_update(ngx_http_request_t *r)
+{
+    ngx_http_request_t         *sr;
+    ngx_http_posted_request_t  *pr;
+
+    /*
+     * the slice is going to be fetched again, so a background
+     * cache update posted for it is not needed; it is cancelled
+     * only if it has not started yet
+     */
+
+    for (pr = r->main->posted_requests; pr; pr = pr->next) {
+        sr = pr->request;
+
+        if (sr->background
+            && sr->parent == r
+            && sr->upstream == NULL
+            && sr->write_event_handler == ngx_http_core_run_phases)
+        {
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "http slice cancel background update: \"%V\"",
+                           &sr->uri);
+
+            sr->write_event_handler = ngx_http_slice_cancelled_handler;
+        }
+    }
+}
+
+
+static void
+ngx_http_slice_cancelled_handler(ngx_http_request_t *r)
+{
+    ngx_http_finalize_request(r, NGX_OK);
+}
+
+#endif
+
+
 static void *
 ngx_http_slice_create_loc_conf(ngx_conf_t *cf)
 {
@@ -536,6 +700,14 @@ ngx_http_slice_add_variables(ngx_conf_t *cf)
     }
 
     var->get_handler = ngx_http_slice_range_variable;
+
+    var = ngx_http_add_variable(cf, &ngx_http_slice_refetch_name,
+                                NGX_HTTP_VAR_NOCACHEABLE);
+    if (var == NULL) {
+        return NGX_ERROR;
+    }
+
+    var->get_handler = ngx_http_slice_refetch_variable;
 
     return NGX_OK;
 }
